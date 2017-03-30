@@ -34,6 +34,7 @@ const (
 	OModel byte = 1 << iota
 	OController
 	ORouter
+	OView
 )
 
 // DbTransformer has method to reverse engineer a database schema to restful api code
@@ -62,6 +63,7 @@ type MvcPath struct {
 	ModelPath      string
 	ControllerPath string
 	RouterPath     string
+	ViewPath       string
 }
 
 // typeMapping maps SQL data type to corresponding Go data type
@@ -267,9 +269,12 @@ func GenerateAppcode(driver, connStr, level, tables, currpath string) {
 		mode = OModel | OController
 	case "3":
 		mode = OModel | OController | ORouter
+	case "4":
+		mode = OModel | OController | ORouter | OView
 	default:
 		log.Fatal("Invalid level value. Must be either \"1\", \"2\", or \"3\"")
 	}
+
 	var selectedTables map[string]bool
 	if tables != "" {
 		selectedTables = make(map[string]bool)
@@ -277,6 +282,7 @@ func GenerateAppcode(driver, connStr, level, tables, currpath string) {
 			selectedTables[v] = true
 		}
 	}
+
 	switch driver {
 	case "mysql":
 	case "postgres":
@@ -295,16 +301,21 @@ func gen(dbms, connStr string, mode byte, selectedTableNames map[string]bool, ap
 	if err != nil {
 		log.Fatalf("Could not connect to '%s' database using '%s': %s", dbms, connStr, err)
 	}
+
 	defer db.Close()
 	if trans, ok := dbDriver[dbms]; ok {
 		log.Info("Analyzing database tables...")
+
 		tableNames := trans.GetTableNames(db)
 		tables := getTableObjects(tableNames, db, trans)
+
 		mvcPath := new(MvcPath)
 		mvcPath.ModelPath = path.Join(apppath, "models")
 		mvcPath.ControllerPath = path.Join(apppath, "controllers")
 		mvcPath.RouterPath = path.Join(apppath, "routers")
+		mvcPath.ViewPath = path.Join(apppath, "views")
 		createPaths(mode, mvcPath)
+
 		pkgPath := getPackagePath(apppath)
 		writeSourceFiles(pkgPath, tables, mode, mvcPath, selectedTableNames)
 	} else {
@@ -417,7 +428,7 @@ func (mysqlDB *MysqlDB) GetColumns(db *sql.DB, table *Table, blackList map[strin
 	for colDefRows.Next() {
 		// datatype as bytes so that SQL <null> values can be retrieved
 		var colNameBytes, dataTypeBytes, columnTypeBytes, isNullableBytes, columnDefaultBytes, extraBytes []byte
-		if err := colDefRows.Scan(&colNameBytes, &dataTypeBytes, &columnTypeBytes, &isNullableBytes, &columnDefaultBytes, &extraBytes); err != nil {
+		if err = colDefRows.Scan(&colNameBytes, &dataTypeBytes, &columnTypeBytes, &isNullableBytes, &columnDefaultBytes, &extraBytes); err != nil {
 			log.Fatal("Could not query INFORMATION_SCHEMA for column information")
 		}
 		colName, dataType, columnType, isNullable, columnDefault, extra :=
@@ -619,7 +630,7 @@ func (postgresDB *PostgresDB) GetColumns(db *sql.DB, table *Table, blackList map
 	for colDefRows.Next() {
 		// datatype as bytes so that SQL <null> values can be retrieved
 		var colNameBytes, dataTypeBytes, columnTypeBytes, isNullableBytes, columnDefaultBytes, extraBytes []byte
-		if err := colDefRows.Scan(&colNameBytes, &dataTypeBytes, &columnTypeBytes, &isNullableBytes, &columnDefaultBytes, &extraBytes); err != nil {
+		if err = colDefRows.Scan(&colNameBytes, &dataTypeBytes, &columnTypeBytes, &isNullableBytes, &columnDefaultBytes, &extraBytes); err != nil {
 			log.Fatalf("Could not query INFORMATION_SCHEMA for column information: %s", err)
 		}
 		colName, dataType, columnType, isNullable, columnDefault, extra :=
@@ -711,6 +722,9 @@ func createPaths(mode byte, paths *MvcPath) {
 	}
 	if (mode & ORouter) == ORouter {
 		os.Mkdir(paths.RouterPath, 0777)
+	}
+	if (mode & ORouter) == OView {
+		os.Mkdir(paths.ViewPath, 0777)
 	}
 }
 
@@ -985,360 +999,3 @@ func getPackagePath(curpath string) (packpath string) {
 	packpath = strings.Join(strings.Split(curpath[len(appsrcpath)+1:], string(filepath.Separator)), "/")
 	return
 }
-
-const (
-	StructModelTPL = `package models
-{{importTimePkg}}
-{{modelStruct}}
-`
-
-	ModelTPL = `package models
-
-import (
-	"errors"
-	"fmt"
-	"reflect"
-	"strings"
-	{{timePkg}}
-	"github.com/astaxie/beego/orm"
-)
-
-{{modelStruct}}
-
-func (t *{{modelName}}) TableName() string {
-	return "{{tableName}}"
-}
-
-func init() {
-	orm.RegisterModel(new({{modelName}}))
-}
-
-// Add{{modelName}} insert a new {{modelName}} into database and returns
-// last inserted Id on success.
-func Add{{modelName}}(m *{{modelName}}) (id int64, err error) {
-	o := orm.NewOrm()
-	id, err = o.Insert(m)
-	return
-}
-
-// Get{{modelName}}ById retrieves {{modelName}} by Id. Returns error if
-// Id doesn't exist
-func Get{{modelName}}ById(id int) (v *{{modelName}}, err error) {
-	o := orm.NewOrm()
-	v = &{{modelName}}{Id: id}
-	if err = o.Read(v); err == nil {
-		return v, nil
-	}
-	return nil, err
-}
-
-// GetAll{{modelName}} retrieves all {{modelName}} matches certain condition. Returns empty list if
-// no records exist
-func GetAll{{modelName}}(query map[string]string, fields []string, sortby []string, order []string,
-	offset int64, limit int64) (ml []interface{}, err error) {
-	o := orm.NewOrm()
-	qs := o.QueryTable(new({{modelName}}))
-	// query k=v
-	for k, v := range query {
-		// rewrite dot-notation to Object__Attribute
-		k = strings.Replace(k, ".", "__", -1)
-		if strings.Contains(k, "isnull") {
-			qs = qs.Filter(k, (v == "true" || v == "1"))
-		} else {
-			qs = qs.Filter(k, v)
-		}
-	}
-	// order by:
-	var sortFields []string
-	if len(sortby) != 0 {
-		if len(sortby) == len(order) {
-			// 1) for each sort field, there is an associated order
-			for i, v := range sortby {
-				orderby := ""
-				if order[i] == "desc" {
-					orderby = "-" + v
-				} else if order[i] == "asc" {
-					orderby = v
-				} else {
-					return nil, errors.New("Error: Invalid order. Must be either [asc|desc]")
-				}
-				sortFields = append(sortFields, orderby)
-			}
-			qs = qs.OrderBy(sortFields...)
-		} else if len(sortby) != len(order) && len(order) == 1 {
-			// 2) there is exactly one order, all the sorted fields will be sorted by this order
-			for _, v := range sortby {
-				orderby := ""
-				if order[0] == "desc" {
-					orderby = "-" + v
-				} else if order[0] == "asc" {
-					orderby = v
-				} else {
-					return nil, errors.New("Error: Invalid order. Must be either [asc|desc]")
-				}
-				sortFields = append(sortFields, orderby)
-			}
-		} else if len(sortby) != len(order) && len(order) != 1 {
-			return nil, errors.New("Error: 'sortby', 'order' sizes mismatch or 'order' size is not 1")
-		}
-	} else {
-		if len(order) != 0 {
-			return nil, errors.New("Error: unused 'order' fields")
-		}
-	}
-
-	var l []{{modelName}}
-	qs = qs.OrderBy(sortFields...)
-	if _, err = qs.Limit(limit, offset).All(&l, fields...); err == nil {
-		if len(fields) == 0 {
-			for _, v := range l {
-				ml = append(ml, v)
-			}
-		} else {
-			// trim unused fields
-			for _, v := range l {
-				m := make(map[string]interface{})
-				val := reflect.ValueOf(v)
-				for _, fname := range fields {
-					m[fname] = val.FieldByName(fname).Interface()
-				}
-				ml = append(ml, m)
-			}
-		}
-		return ml, nil
-	}
-	return nil, err
-}
-
-// Update{{modelName}} updates {{modelName}} by Id and returns error if
-// the record to be updated doesn't exist
-func Update{{modelName}}ById(m *{{modelName}}) (err error) {
-	o := orm.NewOrm()
-	v := {{modelName}}{Id: m.Id}
-	// ascertain id exists in the database
-	if err = o.Read(&v); err == nil {
-		var num int64
-		if num, err = o.Update(m); err == nil {
-			fmt.Println("Number of records updated in database:", num)
-		}
-	}
-	return
-}
-
-// Delete{{modelName}} deletes {{modelName}} by Id and returns error if
-// the record to be deleted doesn't exist
-func Delete{{modelName}}(id int) (err error) {
-	o := orm.NewOrm()
-	v := {{modelName}}{Id: id}
-	// ascertain id exists in the database
-	if err = o.Read(&v); err == nil {
-		var num int64
-		if num, err = o.Delete(&{{modelName}}{Id: id}); err == nil {
-			fmt.Println("Number of records deleted in database:", num)
-		}
-	}
-	return
-}
-`
-	CtrlTPL = `package controllers
-
-import (
-	"{{pkgPath}}/models"
-	"encoding/json"
-	"errors"
-	"strconv"
-	"strings"
-
-	"github.com/astaxie/beego"
-)
-
-// {{ctrlName}}Controller operations for {{ctrlName}}
-type {{ctrlName}}Controller struct {
-	beego.Controller
-}
-
-// URLMapping ...
-func (c *{{ctrlName}}Controller) URLMapping() {
-	c.Mapping("Post", c.Post)
-	c.Mapping("GetOne", c.GetOne)
-	c.Mapping("GetAll", c.GetAll)
-	c.Mapping("Put", c.Put)
-	c.Mapping("Delete", c.Delete)
-}
-
-// Post ...
-// @Title Post
-// @Description create {{ctrlName}}
-// @Param	body		body 	models.{{ctrlName}}	true		"body for {{ctrlName}} content"
-// @Success 201 {int} models.{{ctrlName}}
-// @Failure 403 body is empty
-// @router / [post]
-func (c *{{ctrlName}}Controller) Post() {
-	var v models.{{ctrlName}}
-	if err := json.Unmarshal(c.Ctx.Input.RequestBody, &v); err == nil {
-		if _, err := models.Add{{ctrlName}}(&v); err == nil {
-			c.Ctx.Output.SetStatus(201)
-			c.Data["json"] = v
-		} else {
-			c.Data["json"] = err.Error()
-		}
-	} else {
-		c.Data["json"] = err.Error()
-	}
-	c.ServeJSON()
-}
-
-// GetOne ...
-// @Title Get One
-// @Description get {{ctrlName}} by id
-// @Param	id		path 	string	true		"The key for staticblock"
-// @Success 200 {object} models.{{ctrlName}}
-// @Failure 403 :id is empty
-// @router /:id [get]
-func (c *{{ctrlName}}Controller) GetOne() {
-	idStr := c.Ctx.Input.Param(":id")
-	id, _ := strconv.Atoi(idStr)
-	v, err := models.Get{{ctrlName}}ById(id)
-	if err != nil {
-		c.Data["json"] = err.Error()
-	} else {
-		c.Data["json"] = v
-	}
-	c.ServeJSON()
-}
-
-// GetAll ...
-// @Title Get All
-// @Description get {{ctrlName}}
-// @Param	query	query	string	false	"Filter. e.g. col1:v1,col2:v2 ..."
-// @Param	fields	query	string	false	"Fields returned. e.g. col1,col2 ..."
-// @Param	sortby	query	string	false	"Sorted-by fields. e.g. col1,col2 ..."
-// @Param	order	query	string	false	"Order corresponding to each sortby field, if single value, apply to all sortby fields. e.g. desc,asc ..."
-// @Param	limit	query	string	false	"Limit the size of result set. Must be an integer"
-// @Param	offset	query	string	false	"Start position of result set. Must be an integer"
-// @Success 200 {object} models.{{ctrlName}}
-// @Failure 403
-// @router / [get]
-func (c *{{ctrlName}}Controller) GetAll() {
-	var fields []string
-	var sortby []string
-	var order []string
-	var query = make(map[string]string)
-	var limit int64 = 10
-	var offset int64
-
-	// fields: col1,col2,entity.col3
-	if v := c.GetString("fields"); v != "" {
-		fields = strings.Split(v, ",")
-	}
-	// limit: 10 (default is 10)
-	if v, err := c.GetInt64("limit"); err == nil {
-		limit = v
-	}
-	// offset: 0 (default is 0)
-	if v, err := c.GetInt64("offset"); err == nil {
-		offset = v
-	}
-	// sortby: col1,col2
-	if v := c.GetString("sortby"); v != "" {
-		sortby = strings.Split(v, ",")
-	}
-	// order: desc,asc
-	if v := c.GetString("order"); v != "" {
-		order = strings.Split(v, ",")
-	}
-	// query: k:v,k:v
-	if v := c.GetString("query"); v != "" {
-		for _, cond := range strings.Split(v, ",") {
-			kv := strings.SplitN(cond, ":", 2)
-			if len(kv) != 2 {
-				c.Data["json"] = errors.New("Error: invalid query key/value pair")
-				c.ServeJSON()
-				return
-			}
-			k, v := kv[0], kv[1]
-			query[k] = v
-		}
-	}
-
-	l, err := models.GetAll{{ctrlName}}(query, fields, sortby, order, offset, limit)
-	if err != nil {
-		c.Data["json"] = err.Error()
-	} else {
-		c.Data["json"] = l
-	}
-	c.ServeJSON()
-}
-
-// Put ...
-// @Title Put
-// @Description update the {{ctrlName}}
-// @Param	id		path 	string	true		"The id you want to update"
-// @Param	body		body 	models.{{ctrlName}}	true		"body for {{ctrlName}} content"
-// @Success 200 {object} models.{{ctrlName}}
-// @Failure 403 :id is not int
-// @router /:id [put]
-func (c *{{ctrlName}}Controller) Put() {
-	idStr := c.Ctx.Input.Param(":id")
-	id, _ := strconv.Atoi(idStr)
-	v := models.{{ctrlName}}{Id: id}
-	if err := json.Unmarshal(c.Ctx.Input.RequestBody, &v); err == nil {
-		if err := models.Update{{ctrlName}}ById(&v); err == nil {
-			c.Data["json"] = "OK"
-		} else {
-			c.Data["json"] = err.Error()
-		}
-	} else {
-		c.Data["json"] = err.Error()
-	}
-	c.ServeJSON()
-}
-
-// Delete ...
-// @Title Delete
-// @Description delete the {{ctrlName}}
-// @Param	id		path 	string	true		"The id you want to delete"
-// @Success 200 {string} delete success!
-// @Failure 403 id is empty
-// @router /:id [delete]
-func (c *{{ctrlName}}Controller) Delete() {
-	idStr := c.Ctx.Input.Param(":id")
-	id, _ := strconv.Atoi(idStr)
-	if err := models.Delete{{ctrlName}}(id); err == nil {
-		c.Data["json"] = "OK"
-	} else {
-		c.Data["json"] = err.Error()
-	}
-	c.ServeJSON()
-}
-`
-	RouterTPL = `// @APIVersion 1.0.0
-// @Title beego Test API
-// @Description beego has a very cool tools to autogenerate documents for your API
-// @Contact astaxie@gmail.com
-// @TermsOfServiceUrl http://beego.me/
-// @License Apache 2.0
-// @LicenseUrl http://www.apache.org/licenses/LICENSE-2.0.html
-package routers
-
-import (
-	"{{pkgPath}}/controllers"
-
-	"github.com/astaxie/beego"
-)
-
-func init() {
-	ns := beego.NewNamespace("/v1",
-		{{nameSpaces}}
-	)
-	beego.AddNamespace(ns)
-}
-`
-	NamespaceTPL = `
-		beego.NSNamespace("/{{nameSpace}}",
-			beego.NSInclude(
-				&controllers.{{ctrlName}}Controller{},
-			),
-		),
-`
-)
